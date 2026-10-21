@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Intent-Aware Authorization Broker</title>
+<style>
+:root{--bg:#0b1020;--panel:#131b2e;--panel2:#19243a;--line:#2a3955;--text:#e8eefb;--muted:#9eb0ce;--blue:#6ea8fe;--green:#39d98a;--yellow:#ffd166;--red:#ff6b81}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#0b1020,#111a2e);color:var(--text);font:15px/1.5 system-ui,Segoe UI,Arial}
+header{padding:26px max(20px,calc((100% - 1100px)/2));border-bottom:1px solid var(--line);background:#0b1020cc}
+h1{font-size:clamp(23px,3vw,34px);margin:0 0 6px}p{color:var(--muted);margin:4px 0}
+main{max-width:1100px;margin:22px auto;padding:0 18px;display:grid;grid-template-columns:1fr 1.2fr;gap:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:0 12px 32px #0002}
+h2{font-size:18px;margin:0 0 12px}.hint{font-size:13px;color:var(--muted)}
+label{display:block;font-weight:600;margin:12px 0 5px}input,textarea{width:100%;background:#0b1324;border:1px solid var(--line);border-radius:9px;padding:11px;color:var(--text);font:inherit}
+textarea{min-height:90px;resize:vertical}.checks{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}.checks label{margin:0;font-weight:400;background:var(--panel2);padding:8px;border-radius:8px}
+button{border:0;border-radius:9px;padding:10px 13px;background:var(--blue);color:#091326;font-weight:700;cursor:pointer;margin:5px 5px 0 0}button.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--line)}button:disabled{opacity:.5;cursor:not-allowed}
+.status{padding:12px;border:1px solid var(--line);border-radius:10px;background:#0b1324;margin-top:12px;overflow-wrap:anywhere}
+.pill{display:inline-block;padding:3px 9px;border-radius:99px;font-size:12px;font-weight:800;background:#24344d}.ALLOW{color:var(--green)}.REVIEW{color:var(--yellow)}.DENY{color:var(--red)}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;color:#c9dcff;font-size:12px}.audit-item{padding:12px;border-top:1px solid var(--line)}.audit-item:first-child{border-top:0}
+.full{grid-column:1/-1}.row{display:flex;justify-content:space-between;gap:12px;align-items:center}.tiny{font-size:12px;color:var(--muted)}
+@media(max-width:780px){main{grid-template-columns:1fr}.full{grid-column:auto}}
+</style>
+</head>
+<body>
+<header><h1>Intent-Aware Zero-Trust Authorization Broker</h1><p>AI actions are proposed by the agent and independently checked by the broker before tool execution.</p></header>
+<main>
+<section class="card">
+<h2>1. Trusted session</h2>
+<p class="hint">Set the user's intended task and the actions delegated to this session.</p>
+<label for="intent">Trusted user intent</label>
+<textarea id="intent">Schedule meetings, draft emails, and send email messages for me. Never send files or transfer money.</textarea>
+<label>Allowed action scopes</label>
+<div class="checks">
+<label><input type="checkbox" value="calendar.create_event" checked> Calendar: create event</label>
+<label><input type="checkbox" value="email.draft" checked> Email: draft</label>
+<label><input type="checkbox" value="email.send" checked> Email: send (review required)</label>
+<label><input type="checkbox" value="wallet.transfer"> Wallet: transfer</label>
+<label><input type="checkbox" value="files.read"> Files: read</label>
+<label><input type="checkbox" value="files.send"> Files: send</label>
+</div>
+<button id="createSession">Create demo session</button>
+<div id="sessionStatus" class="status">No session created yet.</div>
+</section>
+<section class="card">
+<h2>2. Propose an action</h2>
+<p class="hint">Try the examples. The parser is rule-based in this prototype; it does not call an LLM.</p>
+<label for="request">Natural-language request</label>
+<textarea id="request">Schedule a meeting with Rahul tomorrow at 10 AM</textarea>
+<div>
+<button class="secondary example" data-text="Schedule a meeting with Rahul tomorrow at 10 AM">ALLOW example</button>
+<button class="secondary example" data-text="Send an email to Rahul saying the meeting is confirmed">REVIEW example</button>
+<button class="secondary example" data-text="Send the confidential file to an external recipient">DENY example</button>
+<button class="secondary example" data-text="Transfer 1000 to Alex">Scope / review example</button>
+</div>
+<button id="submitAction">Submit to authorization broker</button>
+<div id="result" class="status">Create a session, then submit an action.</div>
+</section>
+<section class="card full">
+<div class="row"><h2>3. Human review queue</h2><button class="secondary" id="refreshReviews">Refresh</button></div>
+<p class="hint">REVIEW actions remain unexecuted. Approval is recorded for demonstration; it does not auto-execute a pending action.</p>
+<div id="reviews"><p>No review items loaded.</p></div>
+</section>
+<section class="card full">
+<div class="row"><h2>4. Audit trail</h2><button class="secondary" id="refreshAudit">Refresh audit trail</button></div>
+<div id="audit"><p>No audit records loaded.</p></div>
+</section>
+</main>
+<script>
+let sessionId=null, capabilityToken=null;
+const $=id=>document.getElementById(id);
+async function api(url,opts={}) {
+  const headers={"Content-Type":"application/json",...(opts.headers||{})};
+  if(capabilityToken) headers["X-Capability-Token"]=capabilityToken;
+  const r=await fetch(url,{...opts,headers});
+  const data=await r.json().catch(()=>({detail:"Invalid response"}));
+  if(!r.ok) throw new Error(data.detail||`HTTP ${r.status}`);
+  return data;
+}
+function pretty(x){return JSON.stringify(x,null,2)}
+function decisionClass(d){return d==="ALLOW"?"ALLOW":d==="REVIEW"?"REVIEW":"DENY"}
+$("createSession").onclick=async()=>{
+  try{
+    const allowed=[...document.querySelectorAll('.checks input:checked')].map(x=>x.value);
+    if(!allowed.length) throw new Error("Select at least one action scope.");
+    const data=await api("/api/sessions",{method:"POST",body:JSON.stringify({trusted_intent:$("intent").value,allowed_actions:allowed})});
+    sessionId=data.session_id; capabilityToken=data.capability_token;
+    $("sessionStatus").innerHTML=`<b>Session created</b><p class="tiny">ID: ${sessionId}</p><p class="tiny">Token expires: ${data.expires_at}</p><p class="tiny">Token is held in this page's memory and is not shown.</p>`;
+    await refreshAudit(); await refreshReviews();
+  }catch(e){$("sessionStatus").textContent=e.message}
+};
+document.querySelectorAll(".example").forEach(b=>b.onclick=()=>$("request").value=b.dataset.text);
+$("submitAction").onclick=async()=>{
+  try{
+    if(!sessionId) throw new Error("Create a session first.");
+    const data=await api("/api/chat",{method:"POST",body:JSON.stringify({session_id:sessionId,text:$("request").value})});
+    const d=data.authorization;
+    $("result").innerHTML=`<div class="row"><b>Broker decision</b><span class="pill ${decisionClass(d.decision)}">${d.decision}</span></div><p>${d.reason}</p><p><b>Execution:</b> ${d.execution_status}</p><details><summary>View parsed action and tool result</summary><pre>${pretty(data)}</pre></details>`;
+    await refreshAudit(); await refreshReviews();
+  }catch(e){$("result").textContent=e.message}
+};
+async function refreshAudit(){
+ try{
+  const data=await api("/api/audit"+(sessionId?"?session_id="+encodeURIComponent(sessionId):""));
+  $("audit").innerHTML=data.items.length?data.items.map(x=>`<div class="audit-item"><div class="row"><b>${x.action}</b><span class="pill ${decisionClass(x.decision)}">${x.decision}</span></div><p>${x.reason}</p><p class="tiny">${x.execution_status} · ${x.created_at}</p><details><summary>Details</summary><pre>${pretty(x)}</pre></details></div>`).join(""):"<p>No audit records yet.</p>";
+ }catch(e){$("audit").textContent=e.message}
+}
+async function refreshReviews(){
+ try{
+  const data=await api("/api/reviews"+(sessionId?"?session_id="+encodeURIComponent(sessionId):""));
+  $("reviews").innerHTML=data.items.length?data.items.map(x=>`<div class="audit-item"><div class="row"><b>${x.action}</b><span class="pill">${x.status}</span></div><p>${x.reason}</p><p class="tiny">Request: ${x.request_id}</p>${x.status==="PENDING"?`<button onclick="review('${x.request_id}','APPROVE')">Approve (record only)</button><button class="secondary" onclick="review('${x.request_id}','REJECT')">Reject</button>`:""}</div>`).join(""):"<p>No review items.</p>";
+ }catch(e){$("reviews").textContent=e.message}
+}
+window.review=async(id,decision)=>{
+ try{await api("/api/reviews/"+id,{method:"POST",body:JSON.stringify({decision,note:"Demo reviewer decision"})});await refreshReviews();await refreshAudit()}
+ catch(e){alert(e.message)}
+};
+$("refreshAudit").onclick=refreshAudit;$("refreshReviews").onclick=refreshReviews;
+</script>
+</body></html>
