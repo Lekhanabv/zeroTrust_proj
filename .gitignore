@@ -1,0 +1,25 @@
+# Python virtual environments
+.venv/
+**/.venv/
+venv/
+**/venv/
+
+# Python cache and test files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+**/.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db

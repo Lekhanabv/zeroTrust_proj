@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+from app.agent_parser import parse_with_groq
+from app.crypto_utils import encrypt_text, decrypt_text
 import hashlib
 import json
 import os
@@ -10,13 +11,18 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
-
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables from the project root
+load_dotenv(BASE_DIR / ".env")
+REVIEWER_API_KEY = os.getenv("REVIEWER_API_KEY", "")
+
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(BASE_DIR / "broker.db")))
 TOKEN_TTL_MINUTES = int(os.getenv("CAPABILITY_TOKEN_TTL_MINUTES", "120"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -41,9 +47,28 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def iso(dt: datetime | None = None) -> str:
     return (dt or utcnow()).isoformat()
+
+
+def encrypt_json(value: Any) -> str:
+    """Encrypt JSON data before storing it in SQLite."""
+    plaintext = json.dumps(value)
+    return "enc:v1:" + encrypt_text(plaintext)
+
+
+def decrypt_json(value: str | None) -> Any:
+    """Read encrypted JSON and support older plaintext records."""
+    if value is None:
+        return None
+
+    if value.startswith("enc:v1:"):
+        encrypted_value = value[len("enc:v1:"):]
+        plaintext = decrypt_text(encrypted_value)
+        return json.loads(plaintext)
+
+    # Backward compatibility for records created before encryption.
+    return json.loads(value)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -128,6 +153,22 @@ class NaturalRequest(BaseModel):
 class ReviewRequest(BaseModel):
     decision: Literal["APPROVE", "REJECT"]
     note: str = Field(default="", max_length=500)
+
+
+def authenticate_reviewer(reviewer_key: str | None) -> None:
+    if not REVIEWER_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Reviewer authentication is not configured.",
+        )
+
+    if not reviewer_key or not secrets.compare_digest(
+        reviewer_key, REVIEWER_API_KEY
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing reviewer credentials.",
+        )
 
 
 def token_hash(token: str) -> str:
@@ -326,8 +367,8 @@ def audit(request_id: str, session_id: str, action: str, params: dict[str, Any],
             """INSERT INTO audit_logs
             (request_id, session_id, action, parameters, decision, reason, execution_status, tool_result, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (request_id, session_id, action, json.dumps(params), decision, reason,
-             execution_status, json.dumps(result) if result is not None else None, now),
+       (request_id, session_id, action, encrypt_json(params), decision, reason,
+ execution_status, encrypt_json(result) if result is not None else None, now),
         )
         if decision == "REVIEW":
             conn.execute(
@@ -402,20 +443,33 @@ def submit_action(req: ActionRequest, x_capability_token: str | None = Header(de
     return process_action(req, x_capability_token)
 
 
+
 @app.post("/api/chat")
 def chat(req: NaturalRequest, x_capability_token: str | None = Header(default=None)):
-    action, params = parse_natural_request(req.text)
+    try:
+        proposal = parse_with_groq(req.text)
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="The LLM could not produce an action proposal. Please try again.",
+        )
+
+    action = proposal["action"]
+    params = proposal["parameters"]
+
     action_req = ActionRequest(
         session_id=req.session_id,
         request_id=str(uuid.uuid4()),
-        action=action,  # validated against ActionName
+        action=action,
         parameters=params,
     )
+
     return {
-        "parsed_proposal": {"action": action, "parameters": params},
+        "parsed_proposal": proposal,
         "authorization": process_action(action_req, x_capability_token),
-        "note": "This prototype uses a deterministic demo parser, not an LLM.",
+        "note": "The LLM proposes actions; the Zero Trust broker independently enforces authorization.",
     }
+
 
 
 @app.get("/api/audit")
@@ -434,10 +488,10 @@ def get_audit(session_id: str | None = None, limit: int = 100):
     return {"items": [
         {
             "id": r["id"], "request_id": r["request_id"], "session_id": r["session_id"],
-            "action": r["action"], "parameters": json.loads(r["parameters"]),
+            "action": r["action"], "parameters": decrypt_json(r["parameters"]),
             "decision": r["decision"], "reason": r["reason"],
             "execution_status": r["execution_status"],
-            "tool_result": json.loads(r["tool_result"]) if r["tool_result"] else None,
+            "tool_result":decrypt_json(r["tool_result"]) if r["tool_result"] else None,
             "created_at": r["created_at"],
         } for r in rows
     ]}
@@ -458,37 +512,66 @@ def get_reviews(session_id: str | None = None):
     return {"items": [{
         "request_id": r["request_id"], "status": r["status"], "reviewer_note": r["reviewer_note"],
         "updated_at": r["updated_at"], "session_id": r["session_id"], "action": r["action"],
-        "parameters": json.loads(r["parameters"]), "reason": r["reason"]
+        "parameters":decrypt_json(r["parameters"]), "reason": r["reason"]
     } for r in rows]}
 
 
+
 @app.post("/api/reviews/{request_id}")
-def review_action(request_id: str, req: ReviewRequest):
+def review_action(
+    request_id: str,
+    req: ReviewRequest,
+    x_reviewer_key: str | None = Header(default=None),
+):
+    authenticate_reviewer(x_reviewer_key)
+
     with connect_db() as conn:
         row = conn.execute(
-            """SELECT q.status, a.session_id, a.action, a.parameters
-               FROM review_queue q JOIN audit_logs a ON q.request_id = a.request_id
-               WHERE q.request_id = ?""", (request_id,)
+            "SELECT status FROM review_queue WHERE request_id = ?",
+            (request_id,),
         ).fetchone()
+
         if not row:
-            raise HTTPException(status_code=404, detail="Review request not found.")
-        if row["status"] != "PENDING":
-            raise HTTPException(status_code=409, detail="Review request has already been decided.")
-        # Approval is recorded, but tool execution remains a separate controlled step in this prototype.
-        # This avoids pretending a human approval alone is enough to bypass policy checks.
-        conn.execute(
-            "UPDATE review_queue SET status = ?, reviewer_note = ?, updated_at = ? WHERE request_id = ?",
-            (req.decision, req.note, iso(), request_id),
+            raise HTTPException(
+                status_code=404,
+                detail="Review request not found.",
+            )
+
+        now = iso()
+        cursor = conn.execute(
+            """UPDATE review_queue
+               SET status = ?, reviewer_note = ?, updated_at = ?
+               WHERE request_id = ? AND status = 'PENDING'""",
+            (req.decision, req.note, now, request_id),
         )
-        conn.execute(
-            "UPDATE audit_logs SET execution_status = ? WHERE request_id = ?",
-            ("APPROVED_PENDING_EXECUTION" if req.decision == "APPROVE" else "REJECTED_BY_REVIEWER", request_id),
+
+        if cursor.rowcount != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Review request has already been decided.",
+            )
+
+        execution_status = (
+            "APPROVED_PENDING_EXECUTION"
+            if req.decision == "APPROVE"
+            else "REJECTED_BY_REVIEWER"
         )
+
+        conn.execute(
+            """UPDATE audit_logs
+               SET execution_status = ?
+               WHERE request_id = ?""",
+            (execution_status, request_id),
+        )
+
     return {
         "request_id": request_id,
         "review_decision": req.decision,
         "status": "recorded",
-        "message": "Review decision recorded. This demo does not auto-execute a reviewed action."
+        "message": (
+            "Review decision recorded. "
+            "This demo does not auto-execute a reviewed action."
+        ),
     }
 
 
